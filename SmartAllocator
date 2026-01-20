@@ -1,0 +1,1108 @@
+# =========================================================
+# MONTHLY SMART ALLOCATOR
+# =========================================================
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import math, warnings, logging
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+
+warnings.filterwarnings("ignore")
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+# =============== USER SETTINGS ==================
+
+CAPITAL = 1000
+
+TOP_WINNERS = 3
+HONORABLE_MENTIONS = 15
+
+PERIOD_LONG = "10y"
+MIN_YEARS = 5
+
+# ---- Dividend reliability / sustainability ----
+DIV_MIN_YEARS_PAID = 7
+DIV_NO_CUT_YEARS = 5
+DIV_CUT_TOL = -0.05
+DIV_STREAK_MIN = 3
+STABLE_MAX_FCF_PAYOUT = 0.90
+
+# Stable dividend constraints
+STABLE_MIN_DY = 0.02
+STABLE_MAX_DY = 0.06
+STABLE_MAX_PAYOUT = 0.80
+STABLE_MAX_DD = -0.55
+STABLE_MAX_VOL = 0.30
+STABLE_MIN_R2 = 0.65
+STABLE_MIN_SLOPE = 0.02
+
+# Growth constraints
+GROWTH_MIN_CAGR5 = 0.10
+GROWTH_MAX_DD = -0.65
+GROWTH_MAX_VOL = 0.45
+GROWTH_MIN_R2 = 0.60
+GROWTH_MIN_SLOPE = 0.08
+
+# Entry filters (price action)
+LOOK_Z = 200
+LOOK_DD = 252
+DD12_MIN = -0.45
+DD12_MAX = 0.10
+
+# ETF / Exposures
+ETF_TOP = 3
+
+# =============== UNIVERSE =======================
+
+STABLE_UNIVERSE = [
+    "KO","PEP","PG","CL","KMB","MDLZ","WMT","COST","MO","PM",
+    "KHC","UL","CPB","HSY","SYY","CLX","KDP",
+    "GIS","K","TSN","EL","NKE","SBUX","MCO",
+
+    "JNJ","ABBV","MRK","AMGN","BMY","PFE","LLY",
+    "TMO","DHR","ABT","BAX","GILD","CVS","CI","HCA",
+    "MDT","SYK","BSX",
+
+    "NEE","SO","DUK","AEP","XEL","SRE","D","ED","WEC",
+    "PEG","EIX","PCG","EXC","DTE","ES",
+    "AWK",
+
+    "T","VZ","TMUS",
+
+    "JPM","BAC","WFC","C","GS","MS","USB","PNC","BK","AXP",
+    "BLK","TROW","SCHW","SPGI",
+    "PRU","MET","AFL","TRV","CB","ALL",
+    "CME","ICE","MSCI","NDAQ","COF","DFS","PGR","CINF","WRB",
+
+    "BRK-B","MKL","BN",
+
+    "MCD","YUM","TXN","IBM","LMT","RTX","WM","HD","LOW","O","PLD","CSCO",
+    "UNP","NSC","UPS","FDX","CAT","DE","EMR","MMM","HON",
+    "XOM","CVX","COP","EOG",
+    "WMB","OKE","KMI","EPD",
+    "GD","NOC",
+    "AMT","EQIX","DLR","PSA",
+    "PH",
+
+    "ADM","BG",
+
+    "ENB.TO","TRP.TO","PPL.TO","BCE.TO","T.TO","FTS.TO",
+    "RY.TO","TD.TO","BNS.TO","CM.TO",
+    "SU.TO","CNQ.TO","CNR.TO","CP.TO","MFC.TO","SLF.TO","BMO.TO",
+
+    "ULVR.L","DGE.L","BATS.L","GSK.L","AZN.L","NG.L","SSE.L","HSBA.L","BP.L","SHEL.L",
+    "RKT.L","REL.L","LGEN.L","AV.L","PRU.L","GLEN.L",
+    "LSEG.L",
+
+    "NESN.SW","ROG.SW","NOVN.SW","ZURN.SW",
+    "SAN.PA","OR.PA","SU.PA","TTE.PA","DG.PA",
+    "ALV.DE","MUV2.DE","SIE.DE","BAS.DE","BAYN.DE",
+    "ENEL.MI","ENI.MI","ISP.MI","UCG.MI",
+    "IBE.MC","ITX.MC","TEF.MC",
+    "ENR.DE","VOW3.DE","DB1.DE",
+    "AI.PA","BNP.PA","CS.PA","ORA.PA",
+    "LDO.MI","SRG.MI",
+    "ABB","SHL.DE",
+    "VIE.PA","SREN.SW","DHL.DE",
+
+    "NESTE.HE","TELIA.ST","SWMA.ST",
+    "NOVO-B.CO","ORSTED.CO","CARL-B.CO","ATCO-A.ST","EQT.ST",
+
+    "7203.T","MUFG","1299.HK","8001.T",
+
+    "WES.AX","WOW.AX","CBA.AX","WBC.AX","NAB.AX","ANZ.AX",
+    "RIO.L","BHP.AX",
+    "TLS.AX","MQG.AX","WDS.AX"
+]
+
+GROWTH_UNIVERSE = [
+    "MSFT","AAPL","AMZN","GOOGL","META",
+    "NVDA","AVGO","ADBE","CRM","INTU","NOW",
+
+    "MSCI","SNOW","PLTR","ADP","FICO","CDNS","SNPS",
+    "ORCL","IBM","ACN",
+    "CRWD","PANW","ZS","FTNT","NET","DDOG","MDB","TEAM","WDAY","ADSK",
+
+    "MA","V","PYPL",
+    "SQ","ADYEN.AS","SHOP","MELI",
+
+    "TXN","LRCX","TSM","AMD","MU","ADI","NXPI",
+    "AMAT","KLAC","MRVL","ON","QCOM","ARM","SMCI","TSLA",
+
+    "COST","MCD","LIN","SHW","ROP","SPGI","ELV","UNH","ETN","PH","GE","WM",
+    "NFLX","CHTR","HON","ITW","TT","ROK","DE","CAT","URI","FAST",
+
+    "MC.PA","OR.PA","LVMH.PA","SU.PA","KER.PA",
+    "SAP.DE","SIE.DE","AIR.PA",
+    "ASML","NVO","NOVO-B.CO","DSV.CO","RMS.PA","AD.AS","CS.PA",
+
+    "CSL.AX","SONY","TCS.NS","INFY.NS","RELIANCE.NS",
+    "SE","TME",
+    "6758.T","6861.T","8035.T","6954.T","6645.T",
+    "005930.KS","000660.KS","035420.KS",
+    "2330.TW","2454.TW"
+]
+
+ETF_UNIVERSE = [
+    "SWDA.L","IWDA.AS","VWCE.DE","ACWI","VT",
+
+    "SPY","VOO","IVV","VTI","VIG","SCHD","VYM",
+    "VHYL.L","HDV","DVY",
+
+    "BTC-USD","GLD",
+
+    "VEA","VWO","EWJ","EWT","EWY","EWG","EWU","EWI","EWL",
+    "QUAL","USMV","IWM","IWD","SMH","XLK"
+]
+
+GBX_EXCEPT = {"SWDA.L","VHYL.L"}
+
+# =============== PLOT STYLE HELPERS ==================
+
+def _apply_open_dark_style(fig, ax):
+    """
+    Stile 'aperto' coerente (niente bande bianche)
+    """
+    plt.style.use("dark_background")
+    fig.patch.set_facecolor("black")
+    ax.set_facecolor("black")
+    ax.grid(alpha=0.20, linestyle="--")
+    ax.tick_params(colors="white", labelsize=9)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+def plot_series_open(s: pd.Series, title: str, color: str, lw: float = 2.0, figsize=(8.8, 3.2)):
+    s = s.dropna()
+    if s.empty:
+        return
+    fig, ax = plt.subplots(figsize=figsize)
+    _apply_open_dark_style(fig, ax)
+    ax.plot(s.index, s.values, lw=lw, color=color)
+
+    ax.margins(x=0, y=0)
+    ymin, ymax = float(s.min()), float(s.max())
+    pad = (ymax - ymin) * 0.03 if ymax > ymin else (abs(ymax) * 0.03 + 1.0)
+    ax.set_ylim(ymin - pad, ymax + pad)
+
+    ax.set_title(title, color="white", fontsize=12, pad=8)
+    plt.tight_layout(pad=0.2)
+    plt.show()
+
+def plot_series_open_with_hlines(
+    s: pd.Series,
+    title: str,
+    color: str,
+    lw: float = 2.0,
+    hlines=None,
+    figsize=(9.2, 3.2)
+):
+    """
+    Serie + eventuali axhline, in UN solo grafico (fix duplicati).
+    hlines: lista di tuple (y, dict_kwargs)
+    """
+    s = s.dropna()
+    if s.empty:
+        return
+
+    fig, ax = plt.subplots(figsize=figsize)
+    _apply_open_dark_style(fig, ax)
+    ax.plot(s.index, s.values, lw=lw, color=color)
+
+    if hlines:
+        for y, kw in hlines:
+            ax.axhline(y, **kw)
+
+    ax.margins(x=0, y=0)
+    ymin, ymax = float(s.min()), float(s.max())
+    pad = (ymax - ymin) * 0.03 if ymax > ymin else 1.0
+    ax.set_ylim(ymin - pad, ymax + pad)
+
+    ax.set_title(title, color="white", fontsize=12, pad=8)
+    plt.tight_layout(pad=0.2)
+    plt.show()
+
+def plot_two_series_open(s1: pd.Series, s2: pd.Series, title: str, label1: str, label2: str,
+                         color1: str, color2: str, lw1: float = 1.5, lw2: float = 1.5):
+    s1, s2 = s1.dropna(), s2.dropna()
+    if s1.empty or s2.empty:
+        return
+    fig, ax = plt.subplots(figsize=(9.2, 3.2))
+    _apply_open_dark_style(fig, ax)
+    ax.plot(s1.index, s1.values, lw=lw1, label=label1, color=color1)
+    ax.plot(s2.index, s2.values, lw=lw2, label=label2, color=color2)
+
+    ax.margins(x=0, y=0)
+    ymin = float(min(s1.min(), s2.min()))
+    ymax = float(max(s1.max(), s2.max()))
+    pad = (ymax - ymin) * 0.03 if ymax > ymin else 1.0
+    ax.set_ylim(ymin - pad, ymax + pad)
+
+    ax.set_title(title, color="white", fontsize=12, pad=8)
+    leg = ax.legend(facecolor="black", framealpha=0.35)
+    for txt in leg.get_texts():
+        txt.set_color("white")
+    plt.tight_layout(pad=0.2)
+    plt.show()
+
+def plot_pie_open(labels, sizes, colors, title: str):
+    fig, ax = plt.subplots(figsize=(4.2, 4.2))
+    plt.style.use("dark_background")
+    fig.patch.set_facecolor("black")
+    ax.set_facecolor("black")
+
+    wedges, texts, autotexts = ax.pie(
+        sizes, labels=labels, autopct="%1.1f%%",
+        startangle=90, colors=colors
+    )
+    for t in texts:
+        t.set_color("white")
+    for at in autotexts:
+        at.set_color("black")
+        at.set_fontsize(9)
+
+    ax.set_title(title, color="white")
+    ax.axis("equal")
+    plt.tight_layout(pad=0.2)
+    plt.show()
+
+# =============== HELPERS ========================
+
+def safe(x, default=np.nan):
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except:
+        return default
+
+def is_gbx(sym: str) -> bool:
+    return sym.endswith(".L") and sym not in GBX_EXCEPT
+
+def clean_series(s: pd.Series, base_max_jump: float = 0.12) -> pd.Series:
+    if s.empty:
+        return s
+
+    r = s.pct_change()
+    r_valid = r.dropna()
+    if r_valid.empty:
+        return s
+
+    med = r_valid.median()
+    std = r_valid.std()
+    roll_std = r.rolling(20, min_periods=5).std()
+
+    bad = pd.Series(False, index=r.index)
+    if std and std > 0:
+        bad |= (r - med).abs() > 5 * std
+
+    local_cond = (r.abs() > base_max_jump)
+    local_cond &= (r.abs() > 4 * roll_std.fillna(std if std > 0 else 0.5))
+    bad |= local_cond
+
+    if bad.any():
+        s = s.copy()
+        s[bad] = np.nan
+        s = s.interpolate(limit_direction="both")
+
+    return s
+
+def download_price(sym, period=PERIOD_LONG):
+    try:
+        t = yf.Ticker(sym)
+        h = t.history(period=period, auto_adjust=True)
+        if h is None or h.empty:
+            return pd.Series(dtype=float)
+        s = h["Close"].dropna()
+        if is_gbx(sym):
+            s = s * 0.01
+        s = clean_series(s)
+        return s
+    except:
+        return pd.Series(dtype=float)
+
+def linear_and_entry_metrics(s: pd.Series):
+    s = s.dropna()
+    if len(s) < 252 * MIN_YEARS:
+        return (np.nan,)*7
+
+    y = np.log(s.values)
+    x = np.arange(len(y))
+    x_mean, y_mean = x.mean(), y.mean()
+    cov_xy = ((x-x_mean)*(y-y_mean)).sum()
+    var_x = ((x-x_mean)**2).sum()
+    if var_x == 0:
+        return (np.nan,)*7
+    beta = cov_xy / var_x
+    alpha = y_mean - beta*x_mean
+    y_hat = alpha + beta*x
+    ss_tot = ((y-y_mean)**2).sum()
+    ss_res = ((y-y_hat)**2).sum()
+    r2 = 1 - ss_res/ss_tot if ss_tot > 0 else np.nan
+    slope_annual = beta * 252
+
+    roll_max = s.cummax()
+    dd = (s / roll_max - 1.0).min()
+    ret = s.pct_change().dropna()
+    vol = ret.std() * np.sqrt(252) if len(ret) > 20 else np.nan
+
+    if len(s) >= LOOK_Z:
+        ma = s.rolling(LOOK_Z).mean()
+        st = s.rolling(LOOK_Z).std()
+        if not math.isnan(ma.iloc[-1]) and not math.isnan(st.iloc[-1]) and st.iloc[-1] > 0:
+            z = (s.iloc[-1] - ma.iloc[-1]) / st.iloc[-1]
+        else:
+            z = np.nan
+    else:
+        z = np.nan
+
+    if len(s) >= LOOK_DD:
+        dd12 = s.iloc[-1] / s.iloc[-LOOK_DD:].max() - 1.0
+    else:
+        dd12 = np.nan
+
+    cagr5 = np.nan
+    if len(s) >= 252*5:
+        p0 = s.iloc[-252*5]
+        if p0 > 0:
+            cagr5 = (s.iloc[-1] / p0)**(1/5) - 1
+
+    return slope_annual, r2, dd, vol, z, dd12, cagr5
+
+def rank01(series, asc=True):
+    s = pd.Series(series, dtype=float).replace([np.inf,-np.inf], np.nan)
+    r = s.rank(pct=True, ascending=asc)
+    return r.fillna(0.0).clip(0,1)
+
+# =============== DIVIDEND RELIABILITY ============
+
+def annual_dividends(sym: str) -> pd.Series:
+    try:
+        t = yf.Ticker(sym)
+        div = t.dividends
+        if div is None or len(div) == 0:
+            return pd.Series(dtype=float)
+        by = div.groupby(div.index.year).sum()
+        by = by[by > 0]
+        return by.sort_index()
+    except:
+        return pd.Series(dtype=float)
+
+def dividend_quality_metrics(sym: str,
+                             min_years_paid=DIV_MIN_YEARS_PAID,
+                             no_cut_years=DIV_NO_CUT_YEARS,
+                             cut_tol=DIV_CUT_TOL) -> dict:
+    by = annual_dividends(sym)
+    if by.empty or len(by) < 3:
+        return {
+            "years_paid": 0,
+            "streak_up": 0,
+            "no_cut_ok": False,
+            "div_stability": 0.0,
+            "div_cuts": np.nan
+        }
+
+    years_paid = int((by > 0).sum())
+    yoy = by.pct_change().dropna()
+    cuts = (yoy < cut_tol).sum()
+    div_cuts = int(cuts)
+
+    tail = yoy.iloc[-no_cut_years:] if len(yoy) >= no_cut_years else yoy
+    no_cut_ok = bool((tail >= cut_tol).all()) if len(tail) > 0 else False
+
+    streak = 0
+    for v in yoy[::-1]:
+        if v >= 0:
+            streak += 1
+        else:
+            break
+
+    window = by.iloc[-10:] if len(by) >= 10 else by
+    mu = window.mean()
+    sd = window.std(ddof=0)
+    cv = (sd / mu) if mu and mu > 0 else np.inf
+    div_stability = float(1.0 / (1.0 + cv)) if np.isfinite(cv) else 0.0
+
+    return {
+        "years_paid": years_paid,
+        "streak_up": int(streak),
+        "no_cut_ok": no_cut_ok,
+        "div_stability": div_stability,
+        "div_cuts": div_cuts
+    }
+
+def fcf_payout_proxy(sym: str) -> float:
+    try:
+        t = yf.Ticker(sym)
+        cf = t.cashflow
+        if cf is None or cf.empty:
+            return np.nan
+
+        idx = [str(i).lower() for i in cf.index]
+        cf.index = idx
+
+        def pick_row(keys):
+            for k in keys:
+                k = k.lower()
+                if k in cf.index:
+                    return cf.loc[k]
+            return None
+
+        ocf = pick_row([
+            "total cash from operating activities",
+            "operating cash flow",
+            "cashflow from operations"
+        ])
+        capex = pick_row([
+            "capital expenditures",
+            "capital expenditure"
+        ])
+        divpaid = pick_row([
+            "dividends paid",
+            "cash dividends paid"
+        ])
+
+        if ocf is None or capex is None or divpaid is None:
+            return np.nan
+
+        col = cf.columns[0]
+        ocf_v = safe(ocf[col], np.nan)
+        capex_v = safe(capex[col], np.nan)
+        div_v = safe(divpaid[col], np.nan)
+
+        if np.isnan(ocf_v) or np.isnan(capex_v) or np.isnan(div_v):
+            return np.nan
+
+        fcf = ocf_v + capex_v
+        if fcf <= 0:
+            return np.nan
+
+        payout = abs(div_v) / fcf
+        return float(payout)
+    except:
+        return np.nan
+
+def get_dividend_stats(sym, price):
+    t = yf.Ticker(sym)
+    dy = np.nan
+    dcagr5 = 0.0
+    payout = safe((t.info or {}).get("payoutRatio", np.nan))
+
+    try:
+        div = t.dividends
+        if div is not None and len(div) > 0 and price and price > 0:
+            cutoff = div.index.max() - pd.Timedelta(days=365)
+            ttm = float(div[div.index >= cutoff].sum())
+            if ttm > 0:
+                dy = ttm / price
+    except:
+        pass
+
+    if (math.isnan(dy) or dy == 0.0):
+        try:
+            info_dy = safe((t.info or {}).get("dividendYield", np.nan))
+            if info_dy > 0:
+                dy = info_dy
+        except:
+            pass
+
+    try:
+        by = annual_dividends(sym)
+        if len(by) >= 5:
+            y0 = by.index.min()
+            yN = by.index.max()
+            if yN - y0 >= 4 and by.loc[y0] > 0:
+                n = yN - y0
+                dcagr5 = (by.loc[yN] / by.loc[y0])**(1/n) - 1
+    except:
+        pass
+
+    dq = dividend_quality_metrics(sym)
+    fcf_p = fcf_payout_proxy(sym)
+
+    return dy, dcagr5, payout, dq, fcf_p
+
+# =============== STEP 1: MARKET SENTIMENT =================
+
+def pick_world_etf():
+    cands = ["SWDA.L","IWDA.AS","VWCE.DE","ACWI","VT","URTH"]
+    for c in cands:
+        s = download_price(c, "3y")
+        if not s.empty:
+            return c
+    return None
+
+def market_sentiment():
+    spy = download_price("SPY", "3y")
+    world_sym = pick_world_etf()
+    world = download_price(world_sym, "3y") if world_sym else pd.Series(dtype=float)
+
+    vix_hist = yf.download("^VIX", period="3y", auto_adjust=True, progress=False)
+    vix = vix_hist["Close"].dropna() if not vix_hist.empty else pd.Series(dtype=float)
+
+    if spy.empty or world.empty or vix.empty:
+        return {
+            "regime": "Neutral (fallback)",
+            "world_etf": world_sym or "SWDA.L",
+            "weights": {"STABLE_DIV":0.40,"ETF_CORE":0.15,"GROWTH":0.45},
+            "metrics": {}
+        }
+
+    def zscore_200(s):
+        if len(s) < 200:
+            return np.nan
+        ma = s.rolling(200).mean()
+        st = s.rolling(200).std()
+        if st.iloc[-1] == 0 or math.isnan(ma.iloc[-1]) or math.isnan(st.iloc[-1]):
+            return np.nan
+        return (s.iloc[-1] - ma.iloc[-1]) / st.iloc[-1]
+
+    z_spy = zscore_200(spy)
+    z_world = zscore_200(world)
+    r6_spy = spy.iloc[-1] / spy.iloc[-126] - 1 if len(spy) >= 126 else np.nan
+    r6_world = world.iloc[-1] / world.iloc[-126] - 1 if len(world) >= 126 else np.nan
+    vix_now = float(vix.iloc[-1])
+    vix_30d = (vix_now / 100.0) * math.sqrt(30.0 / 365.0)
+    vix_30d_pct = vix_30d * 100.0
+
+    if (z_spy < -0.7 or z_world < -0.7 or r6_spy < -0.10 or r6_world < -0.10) or vix_now > 28:
+        regime = "Risk-Off / Panic"
+        weights = {"STABLE_DIV":0.45,"ETF_CORE":0.30,"GROWTH":0.25}
+    elif (z_spy < 0 or z_world < 0 or r6_spy < 0 or r6_world < 0 or 20 < vix_now <= 28):
+        regime = "Cautious / Defensive"
+        weights = {"STABLE_DIV":0.40,"ETF_CORE":0.25,"GROWTH":0.35}
+    elif (z_spy > 1.0 and z_world > 1.0 and vix_now < 15 and r6_spy > 0.10 and r6_world > 0.10):
+        regime = "Euphoric / Expensive"
+        weights = {"STABLE_DIV":0.45,"ETF_CORE":0.30,"GROWTH":0.25}
+    else:
+        regime = "Neutral / Healthy"
+        weights = {"STABLE_DIV":0.40,"ETF_CORE":0.15,"GROWTH":0.45}
+
+    # Charts (OPEN STYLE, COLORI INVARIATI)
+    base_spy = spy / spy.iloc[0] * 100
+    base_world = world / world.iloc[0] * 100
+    plot_two_series_open(
+        base_spy, base_world,
+        title="SPY vs Global ETF — Rebased 100 (3y)",
+        label1="SPY", label2=world_sym,
+        color1="#9bd3ff", color2="#8cff9b",
+        lw1=1.5, lw2=1.5
+    )
+
+    # VIX (OPEN STYLE) — UNA SOLA VOLTA (FIX)
+    plot_series_open_with_hlines(
+        vix,
+        title="VIX (3y)",
+        color="orange",
+        lw=1.2,
+        hlines=[
+            (20, dict(ls="--", alpha=0.3, color="gray")),
+            (30, dict(ls="--", alpha=0.3, color="gray")),
+        ],
+        figsize=(9.2, 3.2)
+    )
+
+    metrics = {
+        "z_spy": z_spy,
+        "z_world": z_world,
+        "r6_spy": r6_spy,
+        "r6_world": r6_world,
+        "vix": vix_now,
+        "vix_30d_pct": vix_30d_pct
+    }
+
+    return {"regime": regime, "world_etf": world_sym, "weights": weights, "metrics": metrics}
+
+sent = market_sentiment()
+
+print("\n=== MARKET SENTIMENT ===")
+print(f"Regime: {sent['regime']}")
+print(f"Global ETF usato: {sent['world_etf']}")
+
+m = sent["metrics"]
+if m:
+    print(f"z_spy (deviazione vs media a 200 gg): {m['z_spy']:.4f}")
+    print(f"z_world (deviazione vs media a 200 gg): {m['z_world']:.4f}")
+    print(f"r6_spy (rendimento ultimi 6 mesi): {m['r6_spy']*100:.2f}%")
+    print(f"r6_world (rendimento ultimi 6 mesi): {m['r6_world']*100:.2f}%")
+    print(f"VIX: {m['vix']:.2f}  -> volatilità attesa 30 gg ≈ ±{m['vix_30d_pct']:.2f}%")
+
+print("\nSuggested bucket weights:")
+for k, v in sent["weights"].items():
+    print(f"- {k}: {v*100:.1f}%")
+
+labels = ["Stable Div", "ETF Core/Exposures", "High Growth"]
+sizes = [sent["weights"]["STABLE_DIV"], sent["weights"]["ETF_CORE"], sent["weights"]["GROWTH"]]
+colors = ["#00c8ff", "#ffd700", "#b388ff"]
+plot_pie_open(labels, sizes, colors, title="Bucket Allocation")
+
+print("\n[Legenda metriche titoli]")
+print(" DY = Dividend Yield TTM")
+print(" DivC5 = Crescita media annua dividendo (~5y)")
+print(" DivYears = anni con dividendo annuale > 0 (affidabilità)")
+print(" DivStreak = streak aumenti dividendo (affidabilità)")
+print(" NoCut = nessun taglio significativo negli ultimi anni")
+print(" DivStab = stabilità dividendo (1/(1+CV))")
+print(" FCFPay = payout stimato su Free Cash Flow (se disponibile)")
+print(" CAGR5 = Crescita media annua prezzo (~5y)")
+print(" Slope = Trend log-prezzo annualizzato (~10y)")
+print(" R2 = Qualità del trend di lungo periodo")
+print(" DD = Max drawdown storico")
+print(" Vol = Volatilità annualizzata")
+print(" Z = Z-score vs media a 200 gg")
+print(" DD12 = Distanza dal valore massimo a 12 mesi")
+
+# =============== STEP 2: STABLE DIVIDEND PAYERS ===========
+
+def select_stable_dividends():
+    rows = []
+    for sym in sorted(set(STABLE_UNIVERSE)):
+        s = download_price(sym, PERIOD_LONG)
+        if s.empty:
+            continue
+
+        slope, r2, dd, vol, z, dd12, cagr5 = linear_and_entry_metrics(s)
+        if np.isnan(slope) or np.isnan(r2):
+            continue
+
+        price = float(s.iloc[-1])
+        dy, dcagr5, payout, dq, fcf_pay = get_dividend_stats(sym, price)
+
+        if dq["years_paid"] < DIV_MIN_YEARS_PAID:
+            continue
+        if dq["streak_up"] < DIV_STREAK_MIN:
+            continue
+        if not dq["no_cut_ok"]:
+            continue
+        if not np.isnan(fcf_pay) and fcf_pay > STABLE_MAX_FCF_PAYOUT:
+            continue
+        if math.isnan(dy) or dy < STABLE_MIN_DY or dy > STABLE_MAX_DY:
+            continue
+        if not np.isnan(payout) and payout > STABLE_MAX_PAYOUT:
+            continue
+        if not np.isnan(dd) and dd < STABLE_MAX_DD:
+            continue
+        if not np.isnan(vol) and vol > STABLE_MAX_VOL:
+            continue
+        if slope < STABLE_MIN_SLOPE:
+            continue
+        if not np.isnan(dd12) and (dd12 < DD12_MIN or dd12 > DD12_MAX):
+            continue
+
+        rows.append([
+            sym, price, dy, dcagr5, payout,
+            dq["years_paid"], dq["streak_up"], dq["no_cut_ok"], dq["div_stability"], dq["div_cuts"],
+            fcf_pay,
+            slope, r2, dd, vol, z, dd12, cagr5
+        ])
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "Symbol","Price","DY","DivCAGR5","Payout",
+            "DivYears","DivStreak","NoCut","DivStab","DivCuts","FCFPay",
+            "Slope","R2","DD","Vol","Z","DD12","CAGR5","Score"
+        ])
+
+    df = pd.DataFrame(rows, columns=[
+        "Symbol","Price","DY","DivCAGR5","Payout",
+        "DivYears","DivStreak","NoCut","DivStab","DivCuts","FCFPay",
+        "Slope","R2","DD","Vol","Z","DD12","CAGR5"
+    ])
+
+    df["R_DY"]     = rank01(df["DY"], asc=False)
+    df["R_DivGR"]  = rank01(df["DivCAGR5"].clip(lower=0), asc=False)
+
+    df["R_DivYears"]  = rank01(df["DivYears"], asc=False)
+    df["R_Streak"]    = rank01(df["DivStreak"], asc=False)
+    df["R_DivStab"]   = rank01(df["DivStab"], asc=False)
+
+    fcf_rank = rank01(df["FCFPay"], asc=True)
+    fcf_rank = fcf_rank.where(~df["FCFPay"].isna(), 0.5)
+    df["R_FCFPay"] = fcf_rank
+
+    df["R_StabPrice"] = 0.5*rank01(df["DD"], asc=True) + 0.5*rank01(df["Vol"], asc=True)
+    df["R_Trend"]  = 0.6*rank01(df["Slope"], asc=False) + 0.4*rank01(df["R2"], asc=False)
+
+    z_abs = df["Z"].abs()
+    z_base = rank01(z_abs, asc=True)
+    z_bonus = (df["Z"] < 0).astype(float) * 0.3
+    z_score = 0.7*z_base + 0.3*z_bonus
+    dd12_score = rank01(df["DD12"], asc=False)
+    df["R_Entry"] = 0.6*z_score + 0.4*dd12_score
+
+    df["Score"] = (
+        0.22*df["R_DY"] +
+        0.12*df["R_DivGR"] +
+        0.18*(0.45*df["R_DivYears"] + 0.35*df["R_Streak"] + 0.20*df["R_DivStab"]) +
+        0.10*df["R_FCFPay"] +
+        0.16*df["R_StabPrice"] +
+        0.10*df["R_Trend"] +
+        0.12*df["R_Entry"]
+    )
+
+    df = df.sort_values("Score", ascending=False).reset_index(drop=True)
+    return df
+
+stable_df = select_stable_dividends()
+
+print("\n=== STABLE DIVIDEND PAYERS ===")
+if stable_df.empty:
+    print("Nessun titolo stabile trovato.")
+else:
+    top_stable = stable_df.head(TOP_WINNERS).copy()
+    hon_stable = stable_df.iloc[TOP_WINNERS:TOP_WINNERS+HONORABLE_MENTIONS].copy()
+
+    bw = sent["weights"]["STABLE_DIV"] * CAPITAL
+    scores = top_stable["Score"].clip(lower=0)
+    w = (scores / scores.sum()).values if scores.sum() > 0 else np.array([1/TOP_WINNERS]*TOP_WINNERS)
+
+    top_stable["BucketWeight_%"] = (w * 100).round(2)
+    top_stable["EUR"] = (w * bw).round(2)
+
+    print("\nTop Stable Dividend Picks:")
+    display(top_stable[[
+        "Symbol","Price","BucketWeight_%","EUR",
+        "Score","DY","DivCAGR5",
+        "DivYears","DivStreak","NoCut","DivStab","FCFPay","Payout",
+        "CAGR5","Slope","R2","DD","Vol","Z","DD12"
+    ]])
+
+    print("\nStable Dividend — Honorable Mentions:")
+    display(hon_stable[[
+        "Symbol","Price","Score","DY","DivCAGR5",
+        "DivYears","DivStreak","NoCut","DivStab","FCFPay",
+        "Slope","R2","DD","Vol","Z","DD12","CAGR5"
+    ]])
+
+    for sym in top_stable["Symbol"]:
+        s = download_price(sym, PERIOD_LONG)
+        if s.empty:
+            continue
+        plot_series_open(
+            s,
+            title=f"{sym} — Stable Dividend (10y)",
+            color="#00c8ff",
+            lw=2.0
+        )
+
+# =============== STEP 3: HIGH GROWTH COMPOUNDERS =========
+
+def select_growth_compounders():
+    rows = []
+    for sym in sorted(set(GROWTH_UNIVERSE)):
+        s = download_price(sym, PERIOD_LONG)
+        if s.empty:
+            continue
+
+        slope, r2, dd, vol, z, dd12, cagr5 = linear_and_entry_metrics(s)
+        if np.isnan(slope) or np.isnan(r2) or np.isnan(cagr5):
+            continue
+
+        t = yf.Ticker(sym)
+        info = t.info or {}
+        roe  = safe(info.get("returnOnEquity", np.nan))
+        opm  = safe(info.get("operatingMargins", np.nan))
+        revg = safe(info.get("revenueGrowth", np.nan))
+        earng= safe(info.get("earningsGrowth", np.nan))
+        pe   = safe(info.get("trailingPE", np.nan))
+        pb   = safe(info.get("priceToBook", np.nan))
+
+        if cagr5 < GROWTH_MIN_CAGR5:
+            continue
+        if slope < GROWTH_MIN_SLOPE or r2 < GROWTH_MIN_R2:
+            continue
+        if not np.isnan(dd) and dd < GROWTH_MAX_DD:
+            continue
+        if not np.isnan(vol) and vol > GROWTH_MAX_VOL:
+            continue
+        if not np.isnan(roe) and roe < 0.10:
+            continue
+        if not np.isnan(opm) and opm < 0.10:
+            continue
+
+        price = float(s.iloc[-1])
+
+        rows.append([
+            sym, price, cagr5, slope, r2, dd, vol, z, dd12,
+            roe, opm, revg, earng, pe, pb
+        ])
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "Symbol","Price","CAGR5","Slope","R2","DD","Vol",
+            "Z","DD12","ROE","OPM","RevG","EarnG","PE","PB","Score"
+        ])
+
+    df = pd.DataFrame(rows, columns=[
+        "Symbol","Price","CAGR5","Slope","R2","DD","Vol",
+        "Z","DD12","ROE","OPM","RevG","EarnG","PE","PB"
+    ])
+
+    df["R_Growth"] = 0.6*rank01(df["CAGR5"], asc=False) + 0.4*rank01(df["Slope"], asc=False)
+    df["R_Qual"]   = 0.5*rank01(df["ROE"], asc=False) + 0.5*rank01(df["OPM"], asc=False)
+    df["R_Stab"]   = 0.5*rank01(df["DD"], asc=True) + 0.5*rank01(df["Vol"], asc=True)
+    df["R_Val"]    = 0.7*rank01(df["PE"], asc=True) + 0.3*rank01(df["PB"], asc=True)
+
+    z_abs = df["Z"].abs()
+    z_base = rank01(z_abs, asc=True)
+    z_bonus = (df["Z"] < 0).astype(float) * 0.3
+    z_score = 0.7*z_base + 0.3*z_bonus
+    dd12_score = rank01(df["DD12"], asc=False)
+    df["R_Entry"] = 0.6*z_score + 0.4*dd12_score
+
+    df["Score"] = (
+        0.42*df["R_Growth"] +
+        0.22*df["R_Qual"] +
+        0.15*df["R_Stab"] +
+        0.10*df["R_Val"] +
+        0.11*df["R_Entry"]
+    )
+
+    df = df.sort_values("Score", ascending=False).reset_index(drop=True)
+    return df
+
+growth_df = select_growth_compounders()
+
+print("\n=== HIGH GROWTH COMPOUNDERS ===")
+if growth_df.empty:
+    print("Nessun compounder growth trovato.")
+else:
+    top_growth = growth_df.head(TOP_WINNERS).copy()
+    hon_growth = growth_df.iloc[TOP_WINNERS:TOP_WINNERS+HONORABLE_MENTIONS].copy()
+
+    bw = sent["weights"]["GROWTH"] * CAPITAL
+    scores = top_growth["Score"].clip(lower=0)
+    w = (scores / scores.sum()).values if scores.sum() > 0 else np.array([1/TOP_WINNERS]*TOP_WINNERS)
+
+    top_growth["BucketWeight_%"] = (w * 100).round(2)
+    top_growth["EUR"] = (w * bw).round(2)
+
+    print("\nTop High Growth Compounders:")
+    display(top_growth[[
+        "Symbol","Price","BucketWeight_%","EUR",
+        "Score","CAGR5","Slope","R2","DD","Vol",
+        "Z","DD12","ROE","OPM","RevG","EarnG","PE","PB"
+    ]])
+
+    print("\nHigh Growth — Honorable Mentions:")
+    display(hon_growth[[
+        "Symbol","Price","Score","CAGR5","Slope","R2","DD","Vol",
+        "Z","DD12","ROE","OPM","RevG","EarnG","PE","PB"
+    ]])
+
+    for sym in top_growth["Symbol"]:
+        s = download_price(sym, PERIOD_LONG)
+        if s.empty:
+            continue
+        plot_series_open(
+            s,
+            title=f"{sym} — High Growth Compounder (10y)",
+            color="#8cff9b",
+            lw=2.0
+        )
+
+# =============== STEP 4: ETF CORE / EXPOSURES =============
+
+def select_etfs(sent_dict):
+    met = sent_dict.get("metrics", {})
+    vix = met.get("vix", 20.0)
+    z_spy = met.get("z_spy", 0.0)
+
+    rows = []
+    for sym in sorted(set(ETF_UNIVERSE)):
+        s = download_price(sym, "5y")
+        if s.empty:
+            continue
+
+        slope, r2, dd, vol, z, dd12, cagr5 = linear_and_entry_metrics(s)
+        if np.isnan(slope) or np.isnan(r2):
+            continue
+
+        is_btc = (sym == "BTC-USD")
+        is_gold = (sym == "GLD")
+
+        if is_btc:
+            if math.isnan(cagr5) or cagr5 < 0.25:
+                continue
+            if not np.isnan(vol) and vol > 1.0:
+                continue
+            if not np.isnan(dd) and dd < -0.90:
+                continue
+
+        if is_gold:
+            if not np.isnan(vol) and vol > 0.40:
+                continue
+            if not np.isnan(dd) and dd < -0.45:
+                continue
+            if not np.isnan(cagr5) and cagr5 < -0.02:
+                continue
+
+        rows.append([sym, float(s.iloc[-1]), slope, r2, dd, vol, z, dd12, cagr5])
+
+    if not rows:
+        return pd.DataFrame(columns=["Symbol","Price","Score"]), 0.0, 0.0
+
+    df = pd.DataFrame(rows, columns=["Symbol","Price","Slope","R2","DD","Vol","Z","DD12","CAGR5"])
+    df["R_Stab"] = 0.5*rank01(df["DD"], asc=True) + 0.5*rank01(df["Vol"], asc=True)
+    df["Score"] = (
+        0.4*rank01(df["CAGR5"], asc=False) +
+        0.2*rank01(df["Slope"], asc=False) +
+        0.2*rank01(df["R2"], asc=False) +
+        0.2*df["R_Stab"]
+    )
+    df = df.sort_values("Score", ascending=False).reset_index(drop=True)
+
+    if vix < 15 and abs(z_spy) < 1.0:
+        max_btc = 0.12
+    elif 15 <= vix <= 25:
+        max_btc = 0.08
+    elif 25 < vix <= 35:
+        max_btc = 0.05
+    else:
+        max_btc = 0.03
+
+    if vix > 35 or z_spy < -0.5:
+        max_gld = 0.35
+    elif 25 < vix <= 35 or z_spy < 0:
+        max_gld = 0.25
+    elif 18 < vix <= 25:
+        max_gld = 0.15
+    else:
+        max_gld = 0.10
+
+    return df, max_btc, max_gld
+
+etf_df, MAX_BTC, MAX_GLD = select_etfs(sent)
+
+print("\n=== ETF CORE / EXPOSURES (incl. BTC & Gold, dinamici su VIX/Z) ===")
+if etf_df.empty:
+    print("Nessun ETF/exposure idoneo trovato.")
+else:
+    top_etf = etf_df.head(ETF_TOP).copy()
+    bw = sent["weights"]["ETF_CORE"] * CAPITAL
+
+    scores = top_etf["Score"].clip(lower=0)
+    if scores.sum() > 0:
+        w = scores / scores.sum()
+    else:
+        w = pd.Series([1/len(top_etf)]*len(top_etf), index=top_etf.index)
+
+    w = pd.Series(w.values, index=top_etf["Symbol"])
+
+    if "BTC-USD" in w.index:
+        w["BTC-USD"] = min(w["BTC-USD"], MAX_BTC)
+    if "GLD" in w.index:
+        w["GLD"] = min(w["GLD"], MAX_GLD)
+
+    w = w / w.sum()
+
+    top_etf["BucketWeight_%"] = (w.values * 100).round(2)
+    top_etf["EUR"] = (w.values * bw).round(2)
+
+    print(f"\nPeso massimo BTC nel bucket ETF_CORE: {MAX_BTC*100:.1f}%")
+    print(f"Peso massimo GOLD nel bucket ETF_CORE: {MAX_GLD*100:.1f}%")
+
+    print("\nTop ETF / Exposures per il bucket ETF_CORE:")
+    display(top_etf[[
+        "Symbol","Price","BucketWeight_%","EUR",
+        "Score","CAGR5","Slope","R2","DD","Vol","Z","DD12"
+    ]])
+
+    for sym in top_etf["Symbol"]:
+        s = download_price(sym, "5y")
+        if s.empty:
+            continue
+        plot_series_open(
+            s,
+            title=f"{sym} — Core Exposure (5y)",
+            color="orange",
+            lw=2.0
+        )
+
+# =============== STEP 5: CORRELATION TABLE (TOP 9 PICKS) =============
+
+def build_corr_heatmap(top_stable, top_growth, top_etf,
+                       period="3y",
+                       freq="W-FRI",
+                       min_periods=30):
+
+    div_syms = list(top_stable["Symbol"].head(3).values)
+    gro_syms = list(top_growth["Symbol"].head(3).values)
+    etf_syms = list(top_etf["Symbol"].head(3).values)
+    syms = div_syms + gro_syms + etf_syms
+
+    prices = {}
+    for sym in syms:
+        s = download_price(sym, period)
+        if s is None or s.empty:
+            continue
+        prices[sym] = s
+
+    if len(prices) < 2:
+        return
+
+    px = pd.DataFrame(prices).sort_index()
+    px_r = px.resample(freq).last()
+    rets = px_r.pct_change()
+    corr = rets.corr(min_periods=min_periods)
+
+    print("\n=== CORRELATION MATRIX (TOP 9 PICKS) ===")
+    print(f"Frequenza: {freq}  |  Orizzonte prezzi: {period}  |  Min overlap: {min_periods} settimane")
+
+    cmap = LinearSegmentedColormap.from_list(
+        "blue_green_red",
+        ["#0066ff", "#00ff3b", "#ff0000"]
+    )
+
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots(figsize=(9.5, 7.5))
+    fig.patch.set_facecolor("black")
+    ax.set_facecolor("black")
+
+    im = ax.imshow(corr.values, cmap=cmap, vmin=-1, vmax=1)
+
+    labels = corr.columns.tolist()
+    ax.set_xticks(range(len(labels)))
+    ax.set_yticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right", color="white")
+    ax.set_yticklabels(labels, color="white")
+
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            v = corr.values[i, j]
+            if not np.isnan(v):
+                ax.text(j, i, f"{v:.2f}",
+                        ha="center", va="center",
+                        fontsize=9, color="black")
+
+    for k in [2.5, 5.5]:
+        ax.axhline(k, color="white", lw=2, alpha=0.6)
+        ax.axvline(k, color="white", lw=2, alpha=0.6)
+
+    ax.text(1, -0.8, "Dividend",
+            ha="center", va="center",
+            fontsize=12, color="white", fontweight="bold")
+    ax.text(4, -0.8, "Growth",
+            ha="center", va="center",
+            fontsize=12, color="white", fontweight="bold")
+    ax.text(7, -0.8, "Etf",
+            ha="center", va="center",
+            fontsize=12, color="white", fontweight="bold")
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.06)
+    cbar.ax.tick_params(colors="white")
+    cbar.set_label("Correlation", color="white")
+
+    plt.tight_layout(pad=0.2)
+    plt.show()
+
+build_corr_heatmap(
+    top_stable, top_growth, top_etf,
+    period="3y",
+    freq="W-FRI",
+    min_periods=30
+)
