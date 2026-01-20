@@ -1,0 +1,455 @@
+# =========================================================
+# CORRELATION AND BETA BOX
+# =========================================================
+
+!pip -q install yfinance ipywidgets
+
+import warnings, logging
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+
+warnings.filterwarnings("ignore")
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+# ------------------ USER SETTINGS ------------------
+
+PERIOD = "10y"          # history for analysis
+FREQ   = "W-FRI"        # weekly resample (stable corr/beta)
+MIN_PERIODS = 52        # minimum overlap (weeks) to compute corr/beta
+USE_LOG_RETURNS = False # True => corr/beta on log-returns instead of % returns
+
+# World ETF
+WORLD_CANDS = ["SWDA.L", "IWDA.AS", "VWCE.DE", "ACWI", "VT", "URTH"]
+SP500_BENCH = "SPY"
+
+# Some UK tickers on Yahoo are GBX (pence) -> convert to GBP by *0.01 for nicer charts.
+GBX_EXCEPT = {"SWDA.L"}  # keep like your allocator (you can add more if needed)
+
+# ------------------ PLOT STYLE HELPERS ------------------
+
+def _apply_open_dark_style(fig, ax):
+    plt.style.use("dark_background")
+    fig.patch.set_facecolor("black")
+    ax.set_facecolor("black")
+    ax.grid(alpha=0.20, linestyle="--")
+    ax.tick_params(colors="white", labelsize=9)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+def plot_two_series_open(
+    s1: pd.Series, s2: pd.Series, title: str,
+    label1: str, label2: str, color1: str, color2: str,
+    lw1: float = 1.6, lw2: float = 1.6, figsize=(9.2, 3.2),
+    yline0: bool = False
+):
+    s1, s2 = s1.dropna(), s2.dropna()
+    if s1.empty or s2.empty:
+        print(f"[skip plot] dati insufficienti per: {title}")
+        return
+
+    fig, ax = plt.subplots(figsize=figsize)
+    _apply_open_dark_style(fig, ax)
+
+    if yline0:
+        ax.axhline(0, lw=1.0, alpha=0.35)
+
+    ax.plot(s1.index, s1.values, lw=lw1, label=label1, color=color1)
+    ax.plot(s2.index, s2.values, lw=lw2, label=label2, color=color2)
+
+    ax.margins(x=0, y=0)
+    ymin = float(min(s1.min(), s2.min()))
+    ymax = float(max(s1.max(), s2.max()))
+    pad = (ymax - ymin) * 0.03 if ymax > ymin else 1.0
+    ax.set_ylim(ymin - pad, ymax + pad)
+
+    ax.set_title(title, color="white", fontsize=12, pad=8)
+    leg = ax.legend(facecolor="black", framealpha=0.35)
+    for txt in leg.get_texts():
+        txt.set_color("white")
+    plt.tight_layout(pad=0.2)
+    plt.show()
+
+def plot_corr_heatmap(corr: pd.DataFrame, title: str):
+    cmap = LinearSegmentedColormap.from_list(
+        "blue_green_red",
+        ["#0066ff", "#00ff3b", "#ff0000"]
+    )
+    plt.style.use("dark_background")
+    fig, ax = plt.subplots(figsize=(6.8, 5.6))
+    fig.patch.set_facecolor("black")
+    ax.set_facecolor("black")
+
+    im = ax.imshow(corr.values, cmap=cmap, vmin=-1, vmax=1)
+
+    labels = corr.columns.tolist()
+    ax.set_xticks(range(len(labels)))
+    ax.set_yticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=30, ha="right", color="white")
+    ax.set_yticklabels(labels, color="white")
+
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            v = corr.values[i, j]
+            if not np.isnan(v):
+                ax.text(j, i, f"{v:.2f}",
+                        ha="center", va="center",
+                        fontsize=10, color="black")
+
+    ax.set_title(title, color="white", fontsize=12, pad=10)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.06)
+    cbar.ax.tick_params(colors="white")
+    cbar.set_label("Correlation", color="white")
+    plt.tight_layout(pad=0.2)
+    plt.show()
+
+# ------------------ DATA HELPERS ------------------
+
+def is_gbx(sym: str) -> bool:
+    return sym.endswith(".L") and sym not in GBX_EXCEPT
+
+def clean_series(s: pd.Series, base_max_jump: float = 0.12) -> pd.Series:
+    """
+    Outlier-cleaning (ispirato al tuo codice): flags huge jumps and interpolates.
+    """
+    if s is None or s.empty:
+        return pd.Series(dtype=float)
+
+    r = s.pct_change()
+    r_valid = r.dropna()
+    if r_valid.empty:
+        return s
+
+    med = r_valid.median()
+    std = r_valid.std()
+    roll_std = r.rolling(20, min_periods=5).std()
+
+    bad = pd.Series(False, index=r.index)
+    if std and std > 0:
+        bad |= (r - med).abs() > 5 * std
+
+    local_cond = (r.abs() > base_max_jump)
+    local_cond &= (r.abs() > 4 * roll_std.fillna(std if std > 0 else 0.5))
+    bad |= local_cond
+
+    if bad.any():
+        s = s.copy()
+        s[bad] = np.nan
+        s = s.interpolate(limit_direction="both")
+
+    return s
+
+def download_price(sym: str, period: str = PERIOD) -> pd.Series:
+    try:
+        h = yf.Ticker(sym).history(period=period, auto_adjust=True)
+        if h is None or h.empty:
+            return pd.Series(dtype=float)
+        s = h["Close"].dropna()
+        if is_gbx(sym):
+            s = s * 0.01
+        return clean_series(s)
+    except:
+        return pd.Series(dtype=float)
+
+def align_weekly_prices(px: pd.DataFrame, freq: str = FREQ) -> pd.DataFrame:
+    """
+    Weekly resample + ffill (important across exchanges/holidays).
+    """
+    pxw = px.sort_index().resample(freq).last()
+    return pxw.ffill()
+
+def returns_from_prices(pxw: pd.DataFrame, use_log: bool = False) -> pd.DataFrame:
+    if use_log:
+        return np.log(pxw).diff()
+    return pxw.pct_change()
+
+def rolling_corr(a: pd.Series, b: pd.Series, window: int) -> pd.Series:
+    df = pd.concat([a, b], axis=1).dropna()
+    if df.empty or len(df) < window + 5:
+        return pd.Series(dtype=float)
+    return df.iloc[:, 0].rolling(window).corr(df.iloc[:, 1])
+
+# ------------------ BETA HELPERS ------------------
+
+def beta_from_returns(asset_r: pd.Series, bench_r: pd.Series, min_periods: int = MIN_PERIODS) -> float:
+    """
+    Beta = Cov(asset, bench) / Var(bench)
+    """
+    df = pd.concat([asset_r, bench_r], axis=1).dropna()
+    if df.empty or len(df) < min_periods:
+        return np.nan
+    a = df.iloc[:, 0]
+    b = df.iloc[:, 1]
+    vb = b.var(ddof=1)
+    if not np.isfinite(vb) or vb == 0:
+        return np.nan
+    return float(a.cov(b) / vb)
+
+def rolling_beta(asset_r: pd.Series, bench_r: pd.Series, window: int) -> pd.Series:
+    """
+    Rolling beta using rolling Cov/Var.
+    """
+    df = pd.concat([asset_r, bench_r], axis=1).dropna()
+    if df.empty or len(df) < window + 5:
+        return pd.Series(dtype=float)
+    a = df.iloc[:, 0]
+    b = df.iloc[:, 1]
+    cov = a.rolling(window).cov(b)
+    var = b.rolling(window).var()
+    out = cov / var.replace(0, np.nan)
+    return out
+
+# ------------------ BENCHMARK PICKER ------------------
+
+def pick_world_etf(period: str = "3y") -> str:
+    for c in WORLD_CANDS:
+        s = download_price(c, period=period)
+        if s is not None and not s.empty:
+            return c
+    return "SWDA.L"  # fallback
+
+def enforce_overlap(ticker_px: pd.Series, bench_sym: str) -> bool:
+    """
+    Check if weekly overlap >= MIN_PERIODS between ticker and benchmark.
+    """
+    b = download_price(bench_sym, period=PERIOD)
+    if b.empty:
+        return False
+    pxw = align_weekly_prices(pd.DataFrame({"t": ticker_px, "b": b}), freq=FREQ)
+    rets = returns_from_prices(pxw, use_log=USE_LOG_RETURNS).dropna()
+    return len(rets) >= MIN_PERIODS
+
+def pick_world_with_overlap(ticker_px: pd.Series) -> str:
+    """
+    Picks world ETF that both downloads AND has enough overlap with the chosen ticker.
+    """
+    for c in WORLD_CANDS:
+        s = download_price(c, period=PERIOD)
+        if s.empty:
+            continue
+        pxw = align_weekly_prices(pd.DataFrame({"t": ticker_px, "w": s}), freq=FREQ)
+        rets = returns_from_prices(pxw, use_log=USE_LOG_RETURNS).dropna()
+        if len(rets) >= MIN_PERIODS:
+            return c
+    # fallback: at least something that downloads (even if overlap is low)
+    return pick_world_etf(period="3y")
+
+# ------------------ LEGEND ------------------
+
+def print_legend():
+    print("\n[Legenda Correlation + Beta Box]")
+    print(" Corr = correlazione di Pearson sui rendimenti settimanali")
+    print(" Beta = Cov(asset, benchmark) / Var(benchmark) sui rendimenti settimanali")
+    print(" Rebased 100 = serie di prezzi normalizzate (base 100 alla prima data comune)")
+    print(" Rolling Corr 52w = correlazione mobile su ~1 anno")
+    print(" Rolling Corr 156w = correlazione mobile su ~3 anni")
+    print(" Rolling Beta 52w = beta mobile su ~1 anno")
+    print(" Rolling Beta 156w = beta mobile su ~3 anni")
+    print(" Overlap = numero di settimane con dati validi per tutti gli asset")
+    print("")
+    print("[Interpretazione rapida]")
+    print(" Corr ~ 0.00      -> decorrelato")
+    print(" Corr  0.20–0.40  -> bassa correlazione")
+    print(" Corr  0.40–0.60  -> correlazione media")
+    print(" Corr  0.60–0.80  -> alta correlazione")
+    print(" Corr > 0.80      -> molto alta (quasi stesso fattore di rischio)")
+    print("")
+    print(" Beta ~ 1.0  -> sensibilità simile al benchmark")
+    print(" Beta < 1.0  -> meno volatile del benchmark (in media)")
+    print(" Beta > 1.0  -> più volatile del benchmark (in media)")
+    print(" Beta < 0    -> tende a muoversi in senso opposto al benchmark (raro su equity)")
+    print("")
+    print("[Note]")
+    print(" • Corr e Beta non misurano la performance, ma la relazione con il benchmark")
+    print(" • Rolling metrics evidenziano i cambi di regime nel tempo")
+    print(" • Il benchmark 'Global' può includere già molta quota USA → corr/beta elevati sono normali")
+
+# ------------------ MAIN ------------------
+
+def run_correlation(ticker: str):
+    ticker = (ticker or "").strip().upper()
+    if not ticker:
+        print("Inserisci un ticker valido (es. AAPL, ENI.MI, NESN.SW, VOW3.DE...).")
+        return
+
+    # Download target
+    px_t = download_price(ticker, period=PERIOD)
+    if px_t.empty:
+        print(f"Download fallito o dati insufficienti per: {ticker}")
+        return
+
+    # Benchmarks
+    spx_sym = SP500_BENCH
+    world_sym = pick_world_with_overlap(px_t)
+
+    # Ensure SPY overlap; if not, warn (but still try)
+    if not enforce_overlap(px_t, spx_sym):
+        print(f"[warn] Overlap insufficiente con {spx_sym} per {ticker}.")
+        print("Suggerimenti: riduci MIN_PERIODS (es. 26) o usa PERIOD='5y'.")
+
+    # Download benchmarks
+    px_w = download_price(world_sym, period=PERIOD)
+    px_s = download_price(spx_sym,   period=PERIOD)
+
+    if px_w.empty or px_s.empty:
+        print("Impossibile scaricare uno dei benchmark.")
+        print(f"world_sym={world_sym} empty={px_w.empty} | spx_sym={spx_sym} empty={px_s.empty}")
+        return
+
+    # Align weekly
+    px = pd.DataFrame({ticker: px_t, world_sym: px_w, spx_sym: px_s})
+    pxw = align_weekly_prices(px, freq=FREQ)
+
+    # Returns
+    rets = returns_from_prices(pxw, use_log=USE_LOG_RETURNS)
+    rets2 = rets[[ticker, world_sym, spx_sym]].dropna()
+
+    if len(rets2) < MIN_PERIODS:
+        print(f"Overlap troppo basso: {len(rets2)} settimane (< {MIN_PERIODS}).")
+        print("Suggerimenti: riduci MIN_PERIODS (es. 26) o usa PERIOD='5y'.")
+        return
+
+    # Correlations
+    corr_tw = rets2[ticker].corr(rets2[world_sym])
+    corr_ts = rets2[ticker].corr(rets2[spx_sym])
+
+    # Betas
+    beta_tw = beta_from_returns(rets2[ticker], rets2[world_sym], min_periods=MIN_PERIODS)
+    beta_ts = beta_from_returns(rets2[ticker], rets2[spx_sym],   min_periods=MIN_PERIODS)
+
+    # Output summary
+    print("\n=== CORRELATION AND BETA BOX (Allocator Benchmarks) ===")
+    print(f"Titolo: {ticker}")
+    print(f"Global ETF (come allocator): {world_sym}")
+    print(f"S&P500 benchmark (come allocator): {spx_sym}")
+    print(f"Periodo: {PERIOD} | Resample: {FREQ} | Overlap: {len(rets2)} settimane")
+    print(f"Returns: {'log-returns' if USE_LOG_RETURNS else '% returns'}")
+
+    print("\nCorrelazioni (Pearson) su rendimenti settimanali:")
+    print(f"- {ticker} vs {world_sym}: {corr_tw:.3f}")
+    print(f"- {ticker} vs {spx_sym}:   {corr_ts:.3f}")
+
+    print("\nBeta su rendimenti settimanali (Cov/Var):")
+    if np.isfinite(beta_tw):
+        print(f"- {ticker} vs {world_sym}: {beta_tw:.3f}")
+    else:
+        print(f"- {ticker} vs {world_sym}: n/a")
+    if np.isfinite(beta_ts):
+        print(f"- {ticker} vs {spx_sym}:   {beta_ts:.3f}")
+    else:
+        print(f"- {ticker} vs {spx_sym}:   n/a")
+
+    # Heatmap
+    corr_m = rets2[[ticker, world_sym, spx_sym]].corr(min_periods=MIN_PERIODS)
+    plot_corr_heatmap(corr_m, "Correlation Matrix (weekly returns)")
+
+    # Rebased prices
+    base = pxw[[ticker, world_sym, spx_sym]].dropna()
+    if base.empty:
+        print("[skip charts] base prezzi vuota dopo allineamento.")
+        print_legend()
+        return
+    base = base / base.iloc[0] * 100
+
+    plot_two_series_open(
+        base[ticker], base[world_sym],
+        title=f"{ticker} vs {world_sym} — Rebased 100",
+        label1=ticker, label2=world_sym,
+        color1="#9bd3ff", color2="#8cff9b"
+    )
+    plot_two_series_open(
+        base[ticker], base[spx_sym],
+        title=f"{ticker} vs {spx_sym} — Rebased 100",
+        label1=ticker, label2=spx_sym,
+        color1="#9bd3ff", color2="orange"
+    )
+
+    # Rolling correlations
+    roll_1y_w = rolling_corr(rets[ticker], rets[world_sym], 52)
+    roll_1y_s = rolling_corr(rets[ticker], rets[spx_sym],   52)
+    roll_3y_w = rolling_corr(rets[ticker], rets[world_sym], 156)
+    roll_3y_s = rolling_corr(rets[ticker], rets[spx_sym],   156)
+
+    plot_two_series_open(
+        roll_1y_w, roll_1y_s,
+        title="Rolling Correlation (52w ~ 1y)",
+        label1=f"{ticker} vs {world_sym}", label2=f"{ticker} vs {spx_sym}",
+        color1="#8cff9b", color2="orange",
+        lw1=1.4, lw2=1.4,
+        figsize=(9.2, 3.0),
+        yline0=True
+    )
+    plot_two_series_open(
+        roll_3y_w, roll_3y_s,
+        title="Rolling Correlation (156w ~ 3y)",
+        label1=f"{ticker} vs {world_sym}", label2=f"{ticker} vs {spx_sym}",
+        color1="#8cff9b", color2="orange",
+        lw1=1.4, lw2=1.4,
+        figsize=(9.2, 3.0),
+        yline0=True
+    )
+
+    # Rolling betas
+    beta_1y_w = rolling_beta(rets[ticker], rets[world_sym], 52)
+    beta_1y_s = rolling_beta(rets[ticker], rets[spx_sym],   52)
+    beta_3y_w = rolling_beta(rets[ticker], rets[world_sym], 156)
+    beta_3y_s = rolling_beta(rets[ticker], rets[spx_sym],   156)
+
+    plot_two_series_open(
+        beta_1y_w, beta_1y_s,
+        title="Rolling Beta (52w ~ 1y)",
+        label1=f"{ticker} vs {world_sym}", label2=f"{ticker} vs {spx_sym}",
+        color1="#8cff9b", color2="orange",
+        lw1=1.4, lw2=1.4,
+        figsize=(9.2, 3.0),
+        yline0=True
+    )
+    plot_two_series_open(
+        beta_3y_w, beta_3y_s,
+        title="Rolling Beta (156w ~ 3y)",
+        label1=f"{ticker} vs {world_sym}", label2=f"{ticker} vs {spx_sym}",
+        color1="#8cff9b", color2="orange",
+        lw1=1.4, lw2=1.4,
+        figsize=(9.2, 3.0),
+        yline0=True
+    )
+
+    # Legend
+    print_legend()
+
+# ------------------ UI (input box + button) ------------------
+
+ticker_box = widgets.Text(
+    value="AAPL",
+    placeholder="Es. AAPL, ENI.MI, NESN.SW, 7203.T ...",
+    description="Ticker:",
+    style={"description_width": "initial"},
+    layout=widgets.Layout(width="420px")
+)
+
+run_btn = widgets.Button(
+    description="Calcola correlazioni e beta",
+    button_style="info",
+    icon="line-chart",
+    layout=widgets.Layout(width="260px")
+)
+
+out = widgets.Output()
+
+def on_click(_):
+    with out:
+        clear_output(wait=True)
+        run_correlation(ticker_box.value)
+
+run_btn.on_click(on_click)
+
+display(widgets.HBox([ticker_box, run_btn]))
+display(out)
