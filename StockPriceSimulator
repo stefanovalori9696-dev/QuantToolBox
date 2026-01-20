@@ -1,0 +1,418 @@
+# ============================================================
+# FUTURE PRICE ESTIMATOR (5/10/20y)
+# ============================================================
+
+import warnings, logging, math
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter, MultipleLocator
+
+warnings.filterwarnings("ignore")
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+TRADING_DAYS = 252
+
+# ========= HARD CAPS (come richiesto) =========
+X_MAX_HARD = 3000.0   # distribuzioni (asse x)
+Y_MAX_HARD = 3000.0   # fan chart (asse y)
+
+# =========================
+# DARK STYLE
+# =========================
+def _apply_open_dark_style(fig, ax):
+    plt.style.use("dark_background")
+    fig.patch.set_facecolor("black")
+    ax.set_facecolor("black")
+    ax.grid(alpha=0.20, linestyle="--")
+    ax.tick_params(colors="white", labelsize=9)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+# =========================
+# TICKS: NUMERI NORMALI (no k, no scientific)
+# =========================
+def _fmt_plain_int(x, pos=None):
+    return f"{int(round(float(x))):,}"
+
+def apply_plain_numeric_ticks(ax, axis="both", step=300):
+    fmt = FuncFormatter(_fmt_plain_int)
+    if axis in ("both", "x"):
+        ax.xaxis.set_major_formatter(fmt)
+        ax.xaxis.set_major_locator(MultipleLocator(step))
+    if axis in ("both", "y"):
+        ax.yaxis.set_major_formatter(fmt)
+        ax.yaxis.set_major_locator(MultipleLocator(step))
+
+# =========================
+# COLORS
+# =========================
+SCEN_COLORS = {
+    "Conservativo": "#60d5c6",
+    "Base":         "#ff6b6b",
+    "Aggressivo":   "#a6ff4d",
+}
+
+# =========================
+# TABLE (MATPLOTLIB): INQUADRATA + CARINA
+# =========================
+def plot_scenarios_table_dark(df: pd.DataFrame, title: str = "SCENARI (prezzo finale stimato)"):
+    """
+    Tabella come FIGURA (non testo) -> allineamento garantito ovunque.
+    Versione 'inquadrata':
+    - bbox controllato (riempie lo spazio)
+    - font più grande
+    - righe più alte
+    - header più ciccio
+    - zebra striping leggero
+    """
+    def fmt_pct2(x):  return f"{float(x)*100:.2f}%"
+    def fmt_pct1(x):  return f"{float(x)*100:.1f}%"
+    def fmt_price(x): return f"{float(x):,.2f}"
+    def fmt_int(x):   return f"{int(x)}"
+
+    tdf = pd.DataFrame({
+        "Scenario": df["Scenario"].astype(str),
+        "Years": df["Years"].apply(fmt_int),
+        "mu": df["mu"].apply(fmt_pct2),
+        "sigma": df["sigma"].apply(fmt_pct2),
+        "Today": df["Price_Today"].apply(fmt_price),
+        "P5": df["P5"].apply(fmt_price),
+        "Median": df["Median"].apply(fmt_price),
+        "P95": df["P95"].apply(fmt_price),
+        "Prob<Today": df["Prob_End_Below_Today"].apply(fmt_pct1),
+        "CAGR_P5": df["CAGR_P5"].apply(fmt_pct2),
+        "CAGR_Med": df["CAGR_Median"].apply(fmt_pct2),
+        "CAGR_P95": df["CAGR_P95"].apply(fmt_pct2),
+    })
+
+    nrows, ncols = tdf.shape
+
+    fig_w = min(18, max(12, 1.05 * ncols + 3.5))
+    fig_h = max(3.6, 0.55 * nrows + 1.6)
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    plt.style.use("dark_background")
+    fig.patch.set_facecolor("black")
+    ax.set_facecolor("black")
+    ax.axis("off")
+
+    bbox = [0.02, 0.06, 0.96, 0.82]
+
+    table = ax.table(
+        cellText=tdf.values,
+        colLabels=tdf.columns,
+        cellLoc="right",
+        colLoc="center",
+        loc="center",
+        bbox=bbox
+    )
+
+    table.auto_set_font_size(False)
+    base_fs = 11 if ncols <= 12 else 10
+    table.set_fontsize(base_fs)
+    table.scale(1.05, 1.55)
+
+    for (r, c), cell in table.get_celld().items():
+        cell.set_edgecolor((1, 1, 1, 0.14))
+        cell.set_linewidth(0.8)
+        cell.get_text().set_fontfamily("DejaVu Sans Mono")
+        cell.get_text().set_color("white")
+
+        if r == 0:
+            cell.set_facecolor((0.16, 0.16, 0.16, 1.0))
+            cell.get_text().set_weight("bold")
+            cell.get_text().set_ha("center")
+        else:
+            cell.set_facecolor((0.06, 0.06, 0.06, 1.0) if r % 2 == 0 else (0.00, 0.00, 0.00, 1.0))
+            cell.get_text().set_ha("left" if c == 0 else "right")
+
+    ax.text(
+        0.5, 0.94, title,
+        transform=ax.transAxes,
+        ha="center", va="center",
+        fontsize=14, fontweight="bold",
+        color="white"
+    )
+
+    plt.tight_layout(pad=0.2)
+    plt.show()
+
+# =========================
+# DATA HELPERS
+# =========================
+def _is_gbx(sym: str) -> bool:
+    return sym.endswith(".L")
+
+def _extract_series(df: pd.DataFrame, field: str, ticker: str) -> pd.Series:
+    if isinstance(df.columns, pd.MultiIndex):
+        if (field, ticker) in df.columns:
+            s = df[(field, ticker)]
+        elif field in df.columns.get_level_values(0):
+            s = df[field]
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0]
+        else:
+            raise ValueError(f"Colonna {field} non trovata.")
+    else:
+        if field not in df.columns:
+            raise ValueError(f"Colonna '{field}' non trovata.")
+        s = df[field]
+
+    s = pd.Series(s).dropna()
+    if s.empty:
+        raise ValueError(f"Serie {field} vuota.")
+    return s
+
+def fetch_price_and_total_return_index(ticker: str, years_back: int = 20):
+    period = f"{years_back}y"
+    df = yf.download(ticker, period=period, auto_adjust=False, progress=False)
+    if df is None or df.empty:
+        raise ValueError(f"Nessun dato per: {ticker}")
+
+    close = _extract_series(df, "Close", ticker)
+
+    t = yf.Ticker(ticker)
+    div = getattr(t, "dividends", pd.Series(dtype=float))
+    if div is None or len(div) == 0:
+        div_aligned = pd.Series(0.0, index=close.index)
+    else:
+        div_aligned = div.sort_index().reindex(close.index).fillna(0.0)
+
+    if _is_gbx(ticker):
+        close = close * 0.01
+        div_aligned = div_aligned * 0.01
+
+    tr = pd.Series(index=close.index, dtype=float)
+    tr.iloc[0] = 100.0
+    prev_p = float(close.iloc[0])
+
+    for i in range(1, len(close)):
+        p = float(close.iloc[i])
+        d = float(div_aligned.iloc[i])
+        if prev_p > 0 and not np.isnan(prev_p) and not np.isnan(p):
+            tr.iloc[i] = tr.iloc[i - 1] * (p + d) / prev_p
+        else:
+            tr.iloc[i] = tr.iloc[i - 1]
+        prev_p = p
+
+    tr = tr.dropna()
+    if len(tr) < TRADING_DAYS * 3:
+        raise ValueError("Troppi pochi dati (>= 3 anni consigliati).")
+
+    return float(close.iloc[-1]), close, tr
+
+# =========================
+# ROBUST PARAM ESTIMATION
+# =========================
+def winsorize(x: pd.Series, p_low=0.01, p_high=0.99) -> pd.Series:
+    return x.clip(lower=x.quantile(p_low), upper=x.quantile(p_high))
+
+def ewma_vol(logret: pd.Series, lam: float = 0.94) -> float:
+    r = logret.dropna().values
+    if r.size < 60:
+        return float(np.nan)
+    var = 0.0
+    for v in r:
+        var = lam * var + (1 - lam) * (v ** 2)
+    return float(math.sqrt(var) * math.sqrt(TRADING_DAYS))
+
+def estimate_mu_sigma_from_tr(tr_index: pd.Series):
+    logret = np.log(tr_index / tr_index.shift(1)).dropna()
+    logret = winsorize(logret, 0.01, 0.99)
+
+    mu_long = float(logret.mean() * TRADING_DAYS)
+    sigma_long = float(logret.std(ddof=1) * math.sqrt(TRADING_DAYS))
+
+    look = TRADING_DAYS * 3
+    recent = logret.iloc[-look:] if len(logret) >= look else logret
+    mu_recent = float(recent.mean() * TRADING_DAYS)
+
+    sigma_ew = ewma_vol(logret, 0.94)
+    if np.isnan(sigma_ew):
+        sigma_ew = sigma_long
+
+    mu_base = 0.7 * mu_long + 0.3 * mu_recent
+    sigma_base = 0.5 * sigma_long + 0.5 * sigma_ew
+    return {"mu_base": mu_base, "sigma_base": sigma_base, "mu_long": mu_long, "mu_recent": mu_recent}
+
+# =========================
+# SCENARIOS
+# =========================
+def build_scenarios(mu_base: float, sigma_base: float):
+    mu_c = float(np.clip(mu_base - 0.50 * sigma_base, -0.10, 0.12))
+    mu_b = float(np.clip(mu_base, -0.05, 0.15))
+    mu_a = float(np.clip(mu_base + 0.25 * sigma_base, 0.00, 0.20))
+
+    sig_c = float(np.clip(sigma_base * 1.10, 0.08, 1.20))
+    sig_b = float(np.clip(sigma_base,        0.06, 1.20))
+    sig_a = float(np.clip(sigma_base * 0.95, 0.06, 1.20))
+
+    return {"Conservativo": (mu_c, sig_c), "Base": (mu_b, sig_b), "Aggressivo": (mu_a, sig_a)}
+
+# =========================
+# SIMULATION (GBM)
+# =========================
+def simulate_ST(price0: float, mu: float, sigma: float, years: int, n_sims: int = 50000, seed: int = 42):
+    rng = np.random.default_rng(seed + years)
+    Z = rng.standard_normal(n_sims)
+    T = float(years)
+    return price0 * np.exp((mu - 0.5 * sigma ** 2) * T + sigma * math.sqrt(T) * Z)
+
+def summarize_price(ST: np.ndarray, price0: float, years: int):
+    ST = pd.Series(ST).replace([np.inf, -np.inf], np.nan).dropna().values
+    ST = ST[ST > 0]
+    p5, p50, p95 = np.percentile(ST, [5, 50, 95])
+    prob_loss = float(np.mean(ST < price0))
+    cagr = lambda x: (x / price0) ** (1 / years) - 1
+    return {
+        "Years": years,
+        "P5": float(p5),
+        "Median": float(p50),
+        "P95": float(p95),
+        "Prob_End_Below_Today": prob_loss,
+        "CAGR_P5": float(cagr(p5)),
+        "CAGR_Median": float(cagr(p50)),
+        "CAGR_P95": float(cagr(p95)),
+    }
+
+# =========================
+# PLOTS — HARD CAP 0–3000
+# =========================
+def plot_overlay_price_distributions(prices_by_scenario: dict, title: str, today: float):
+    fig, ax = plt.subplots(figsize=(9.8, 3.5))
+    _apply_open_dark_style(fig, ax)
+
+    x_max = X_MAX_HARD
+    bins = np.linspace(0, x_max, 190)
+
+    for scen in ["Conservativo", "Base", "Aggressivo"]:
+        a = pd.Series(prices_by_scenario[scen]).replace([np.inf, -np.inf], np.nan).dropna().values
+        a = a[(a > 0) & (a <= x_max)]
+        if a.size == 0:
+            continue
+        ax.hist(a, bins=bins, density=True, alpha=0.35, label=scen, color=SCEN_COLORS[scen])
+        ax.axvline(np.quantile(a, 0.50), lw=1.3, alpha=0.85, color=SCEN_COLORS[scen])
+
+    ax.axvline(today, lw=1.2, alpha=0.55, color="white", linestyle="--")
+    ax.set_xlim(0, x_max)
+
+    ax.set_title(title, color="white", fontsize=12, pad=8)
+    ax.set_xlabel("Prezzo finale simulato (CAP 3,000)", color="white")
+    ax.set_ylabel("Densità", color="white")
+
+    apply_plain_numeric_ticks(ax, axis="x", step=300)
+
+    leg = ax.legend(facecolor="black", framealpha=0.35, ncol=3)
+    for txt in leg.get_texts():
+        txt.set_color("white")
+
+    plt.tight_layout(pad=0.2)
+    plt.show()
+
+def plot_fan_chart_price_overlay(horizons, sims, title: str, today: float):
+    xs = list(horizons)
+    fig, ax = plt.subplots(figsize=(9.8, 3.7))
+    _apply_open_dark_style(fig, ax)
+
+    for scen in ["Conservativo", "Base", "Aggressivo"]:
+        meds, p5s, p95s = [], [], []
+        for y in horizons:
+            ST = pd.Series(sims[(scen, y)]).replace([np.inf, -np.inf], np.nan).dropna().values
+            ST = ST[ST > 0]
+            p5 = float(np.quantile(ST, 0.05))
+            med = float(np.quantile(ST, 0.50))
+            p95 = float(np.quantile(ST, 0.95))
+            meds.append(med); p5s.append(p5); p95s.append(p95)
+
+        c = SCEN_COLORS[scen]
+        ax.plot(xs, meds, marker="o", lw=2.0, color=c, label=scen)
+        ax.fill_between(xs, p5s, p95s, alpha=0.12, color=c)
+
+    ax.axhline(today, lw=1.2, alpha=0.55, color="white", linestyle="--")
+    ax.set_ylim(0, Y_MAX_HARD)
+
+    ax.set_title(title, color="white", fontsize=12, pad=8)
+    ax.set_xlabel("Anni", color="white")
+    ax.set_ylabel("Prezzo finale simulato (CAP 3,000)", color="white")
+
+    apply_plain_numeric_ticks(ax, axis="y", step=300)
+
+    leg = ax.legend(facecolor="black", framealpha=0.35, ncol=3)
+    for txt in leg.get_texts():
+        txt.set_color("white")
+
+    plt.tight_layout(pad=0.2)
+    plt.show()
+
+# =========================
+# RUNNER
+# =========================
+def run(ticker: str, years_back: int = 20, horizons=(5, 10, 20), n_sims: int = 50000, seed: int = 42):
+    today, close, tr = fetch_price_and_total_return_index(ticker, years_back)
+    est = estimate_mu_sigma_from_tr(tr)
+    scenarios = build_scenarios(est["mu_base"], est["sigma_base"])
+
+    print("\n==============================")
+    print(f"TICKER: {ticker}")
+    print(f"Prezzo attuale (Close): {today:,.2f}")
+    print(f"mu base:   {est['mu_base']:.2%} / anno   (long={est['mu_long']:.2%}, recent={est['mu_recent']:.2%})")
+    print(f"sigma base:{est['sigma_base']:.2%} / anno")
+    print("==============================\n")
+
+    # Prezzo storico (Close)
+    fig, ax = plt.subplots(figsize=(9.8, 3.2))
+    _apply_open_dark_style(fig, ax)
+    ax.plot(close.index, close.values, lw=2.0, color="#9bd3ff")
+    ax.set_title(f"{ticker} — Prezzo storico (Close)", color="white", fontsize=12, pad=8)
+    ax.set_ylabel("Prezzo", color="white")
+    apply_plain_numeric_ticks(ax, axis="y", step=300)
+    plt.tight_layout(pad=0.2)
+    plt.show()
+
+    sims = {}
+    rows = []
+    for scen, (mu, sig) in scenarios.items():
+        for y in horizons:
+            ST = simulate_ST(today, mu, sig, y, n_sims=n_sims, seed=seed)
+            sims[(scen, y)] = ST
+            out = summarize_price(ST, today, y)
+            out["Scenario"] = scen
+            out["mu"] = mu
+            out["sigma"] = sig
+            out["Price_Today"] = today
+            rows.append(out)
+
+    df = pd.DataFrame(rows)
+    scen_order = pd.CategoricalDtype(["Conservativo", "Base", "Aggressivo"], ordered=True)
+    df["Scenario"] = df["Scenario"].astype(scen_order)
+    df = df.sort_values(["Scenario", "Years"]).reset_index(drop=True)
+
+    # TABELLA (bella e centrata)
+    plot_scenarios_table_dark(df, title="SCENARI (prezzo finale stimato)")
+
+    # Distribuzioni (CAP 3,000)
+    for y in horizons:
+        by = {sc: sims[(sc, y)] for sc in ["Conservativo", "Base", "Aggressivo"]}
+        plot_overlay_price_distributions(
+            by,
+            title=f"{ticker} — Disc. PREZZO finale ({y} anni) — 3 scenari (CAP 3,000)",
+            today=today,
+        )
+
+    # Fan chart (CAP 3,000)
+    plot_fan_chart_price_overlay(
+        horizons, sims,
+        title=f"{ticker} — Range PREZZO (P5–P95) + mediana — 3 scenari (CAP 3,000)",
+        today=today,
+    )
+
+    return df
+
+# =========================
+# MAIN
+# =========================
+if __name__ == "__main__":
+    ticker = input("Inserisci ticker (es: MSFT, SAP.DE, VWCE.DE, 7203.T): ").strip().upper()
+    run(ticker, years_back=20, horizons=(5, 10, 20), n_sims=50000, seed=42)
